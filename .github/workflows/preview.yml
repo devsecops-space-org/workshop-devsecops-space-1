@@ -1,0 +1,186 @@
+name: "Preview - Codespace Efímero"
+
+# Se dispara en cada push a main (protegido por branch rules) o manualmente.
+on:
+  push:
+    branches: [main]
+    paths: ["src/**"]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch a desplegar (default: main)"
+        required: false
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    name: "Levantar API de Preview"
+    runs-on: ubuntu-latest
+    outputs:
+      api_url: ${{ steps.url.outputs.url }}
+
+    steps:
+      - name: Eliminar Codespaces previos del repo
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_PAT }}
+        run: |
+          echo "Buscando Codespaces existentes del repo..."
+          EXISTING=$(gh codespace list --repo "${{ github.repository }}" --json name --jq '.[].name')
+
+          if [ -z "$EXISTING" ]; then
+            echo "No hay Codespaces previos."
+          else
+            echo "$EXISTING" | while IFS= read -r cs; do
+              echo "Eliminando: ${cs}"
+              gh codespace delete --codespace "$cs" --force || true
+            done
+            echo "Limpieza completada."
+          fi
+
+      - name: Crear Codespace
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_PAT }}
+        run: |
+          # En dispatch manual usa el input; en workflow_run usa main.
+          BRANCH="${{ inputs.branch || 'main' }}"
+
+          gh codespace create \
+            --repo "${{ github.repository }}" \
+            --branch "${BRANCH}" \
+            --idle-timeout 30m \
+            --retention-period 2h \
+            --machine basicLinux32gb
+
+          NAME=$(gh codespace list \
+            --repo "${{ github.repository }}" \
+            --json name \
+            --jq '.[0].name')
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "Codespace creado: ${NAME}"
+
+      - name: Esperar que el Codespace esté disponible
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_PAT }}
+          CS_NAME: ${{ steps.create.outputs.name }}
+        run: |
+          echo "Esperando estado 'Available'..."
+          READY=false
+          for i in $(seq 1 24); do
+            STATE=$(gh codespace list --json name,state \
+              | jq -r --arg n "$CS_NAME" '.[] | select(.name==$n) | .state')
+            echo "  [${i}/24] estado: ${STATE}"
+            if [ "$STATE" = "Available" ]; then
+              READY=true
+              break
+            fi
+            sleep 15
+          done
+
+          if [ "$READY" != "true" ]; then
+            echo "::error::Codespace no alcanzó estado 'Available' en 6 minutos (último estado: ${STATE})."
+            exit 1
+          fi
+
+      - name: Esperar que postCreateCommand termine (pip + uvicorn)
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_PAT }}
+          CS_NAME: ${{ steps.create.outputs.name }}
+        run: |
+          echo "postCreateCommand instala deps y arranca uvicorn."
+          echo "Esperando a que el puerto 8000 esté expuesto..."
+          # Damos tiempo a que postCreateCommand corra (pip install + uvicorn start).
+          # Verificamos vía gh codespace ports (no requiere SSH).
+          for i in $(seq 1 36); do
+            PORTS=$(gh codespace ports -c "$CS_NAME" --json sourcePort \
+              --jq '.[].sourcePort' 2>/dev/null || echo "")
+            if echo "$PORTS" | grep -q "8000"; then
+              echo "  [${i}/36] Puerto 8000 detectado."
+              break
+            fi
+            echo "  [${i}/36] Puerto 8000 aún no visible. Esperando..."
+            sleep 10
+          done
+
+      - name: Exponer puerto 8000 como público
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_PAT }}
+          CS_NAME: ${{ steps.create.outputs.name }}
+        run: |
+          gh codespace ports visibility 8000:public -c "$CS_NAME"
+
+      - name: Obtener URL y verificar que la API responde
+        id: url
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_PAT }}
+          CS_NAME: ${{ steps.create.outputs.name }}
+        run: |
+          URL=$(gh codespace ports -c "$CS_NAME" --json sourcePort,browseUrl \
+            | jq -r '.[] | select(.sourcePort==8000) | .browseUrl')
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+
+          echo "Verificando que uvicorn responde en ${URL}..."
+          API_READY=false
+          for i in $(seq 1 24); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${URL}/health" || echo "000")
+            echo "  [${i}/24] HTTP ${STATUS}"
+            if [ "$STATUS" = "200" ]; then
+              echo "API lista."
+              API_READY=true
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "$API_READY" != "true" ]; then
+            echo "::warning::API no respondió tras ~4 minutos."
+            echo "::warning::Verificar que postCreateCommand completó pip install + uvicorn start."
+            echo "::error::La API no respondió HTTP 200 en /health (último HTTP: ${STATUS})."
+            exit 1
+          fi
+
+      - name: Publicar resumen con endpoint
+        env:
+          API_URL: ${{ steps.url.outputs.url }}
+          CS_NAME: ${{ steps.create.outputs.name }}
+          # push y dispatch ambos exponen github.sha directamente.
+          SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${SHA:0:7}"
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## API de Preview Lista
+
+          > Commit \`${SHORT_SHA}\` desplegado y accesible.
+
+          | | |
+          |---|---|
+          | **Base URL** | ${API_URL} |
+          | **Health** | ${API_URL}/health |
+          | **Swagger UI** | ${API_URL}/docs |
+          | **Codespace** | \`${CS_NAME}\` |
+          | **Expira** | 30 min sin actividad · máx 2 h |
+
+          ### Probar desde tu local:
+          \`\`\`bash
+          # Health check
+          curl ${API_URL}/health
+
+          # Consultar endpoints disponibles
+          curl ${API_URL}/docs
+          \`\`\`
+
+          > El Codespace se elimina solo al expirar. No requiere limpieza manual.
+          EOF
+
+  functional-tests:
+    name: "Tests Funcionales"
+    needs: preview
+    if: needs.preview.outputs.api_url != ''
+    uses: ./.github/workflows/functional-tests.yml
+    with:
+      base_url: ${{ needs.preview.outputs.api_url }}
+    secrets: inherit

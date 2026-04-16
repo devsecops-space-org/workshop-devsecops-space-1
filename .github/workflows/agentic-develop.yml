@@ -1,0 +1,184 @@
+name: "Agentic - Desarrollo"
+
+# Gatilla cuando un PR de escenarios ([ATDD]) es mergeado a main.
+# Crea un Issue de implementación y asigna automáticamente a Copilot (agent-developer).
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  issues: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  trigger-developer:
+    name: "Crear Issue de Implementación"
+    if: >
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.title, '[ATDD]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extraer referencia del Issue original
+        id: extract
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Buscar referencia al Issue original en el cuerpo del PR
+          ORIG_ISSUE=$(echo "$PR_BODY" | grep -oP '(Refs|Closes|Fixes) #\K\d+' | head -1)
+
+          if [ -z "$ORIG_ISSUE" ]; then
+            echo "::warning::No se encontró referencia al Issue original en el PR."
+            ORIG_ISSUE="N/A"
+          fi
+
+          echo "original_issue=$ORIG_ISSUE" >> "$GITHUB_OUTPUT"
+
+          # Extraer título limpio del PR (remover prefijo [ATDD] Escenarios para:)
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          CLEAN_TITLE=$(echo "$PR_TITLE" | sed 's/\[ATDD\] Escenarios para: //')
+          echo "clean_title=$CLEAN_TITLE" >> "$GITHUB_OUTPUT"
+
+      - name: Listar features aprobados
+        id: features
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Obtener la lista de archivos .feature del PR mergeado
+          FEATURE_FILES=$(gh pr diff "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --name-only | grep '\.feature$' || echo "No se encontraron .feature")
+
+          # Guardar como lista markdown
+          FEATURE_LIST=""
+          while IFS= read -r file; do
+            FEATURE_LIST="${FEATURE_LIST}- \`${file}\`
+          "
+          done <<< "$FEATURE_FILES"
+
+          echo "feature_list<<FEATURES_EOF" >> "$GITHUB_OUTPUT"
+          echo "$FEATURE_LIST" >> "$GITHUB_OUTPUT"
+          echo "FEATURES_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Crear Issue de implementación y asignar Copilot
+        id: create_issue
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_USER_ACCESS_TOKEN }}
+          ORIG_ISSUE: ${{ steps.extract.outputs.original_issue }}
+          CLEAN_TITLE: ${{ steps.extract.outputs.clean_title }}
+          FEATURE_LIST: ${{ steps.features.outputs.feature_list }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Construir referencia al issue original
+          if [ "$ORIG_ISSUE" != "N/A" ]; then
+            ISSUE_REF="Refs #${ORIG_ISSUE}"
+          else
+            ISSUE_REF="Sin referencia directa — revisar PR #${PR_NUMBER}."
+          fi
+
+          # Construir body del Issue
+          BODY=$(cat <<'BODY_HEREDOC'
+          ## Implementación Requerida
+
+          Los escenarios BDD han sido aprobados y mergeados en PR #PLACEHOLDER_PR.
+
+          ### Issue Original
+          PLACEHOLDER_ISSUE_REF
+
+          ### Escenarios Aprobados
+          PLACEHOLDER_FEATURES
+
+          ### Instrucciones
+
+          1. Lee TODOS los archivos `.feature` en `tests/features/`.
+          2. Implementa modelos en `src/models.py`.
+          3. Implementa lógica de negocio en `src/services.py`.
+          4. Implementa endpoints en `src/main.py`.
+          5. Implementa step definitions en `tests/step_defs/`.
+          6. Verifica que `ruff check`, `ruff format`, `bandit` y `pytest` pasen.
+          7. Abre un PR con título `[IMPL] Implementación: PLACEHOLDER_TITLE`.
+
+          ### Restricciones
+          - NO modifiques los archivos `.feature` aprobados.
+          - NO agregues dependencias nuevas.
+          - NO modifiques workflows ni configuración.
+          - Almacenamiento en memoria solamente.
+          BODY_HEREDOC
+          )
+
+          # Sustituir placeholders
+          BODY="${BODY//PLACEHOLDER_PR/$PR_NUMBER}"
+          BODY="${BODY//PLACEHOLDER_ISSUE_REF/$ISSUE_REF}"
+          BODY="${BODY//PLACEHOLDER_FEATURES/$FEATURE_LIST}"
+          BODY="${BODY//PLACEHOLDER_TITLE/$CLEAN_TITLE}"
+
+          # Crear Issue via REST API con asignación a custom agent
+          RESPONSE=$(jq -n \
+            --arg title "[IMPL] Implementación: $CLEAN_TITLE" \
+            --arg body "$BODY" \
+            --arg repo "${{ github.repository }}" \
+            '{
+              title: $title,
+              body: $body,
+              labels: ["agentic-implementation"],
+              assignees: ["copilot-swe-agent[bot]"],
+              agent_assignment: {
+                target_repo: $repo,
+                base_branch: "main",
+                custom_agent: "agent-developer"
+              }
+            }' | gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${{ github.repository }}/issues" \
+              --input -)
+
+          IMPL_ISSUE=$(echo "$RESPONSE" | jq -r '.number')
+          echo "impl_issue=$IMPL_ISSUE" >> "$GITHUB_OUTPUT"
+          echo "Issue #${IMPL_ISSUE} creado con Copilot asignado."
+        continue-on-error: true
+
+      - name: Notificar estado
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CREATE_OUTCOME: ${{ steps.create_issue.outcome }}
+          IMPL_ISSUE: ${{ steps.create_issue.outputs.impl_issue }}
+        run: |
+          if [ -z "$IMPL_ISSUE" ] || [ "$IMPL_ISSUE" = "null" ]; then
+            echo "::error::No se pudo crear el Issue de implementación."
+            echo "Verifica que COPILOT_USER_ACCESS_TOKEN esté configurado (GitHub App user token)."
+            exit 1
+          fi
+
+          if [ "$CREATE_OUTCOME" = "success" ]; then
+            gh issue comment "$IMPL_ISSUE" \
+              --repo "${{ github.repository }}" \
+              --body "✅ **Agente de Desarrollo asignado automáticamente.**
+
+          Los escenarios BDD fueron aprobados en PR #${{ github.event.pull_request.number }}.
+          Copilot está implementando el código.
+
+          | Qué hará el agente | Restricción |
+          |---|---|
+          | Implementar modelos Pydantic v2 | Solo modificar \`src/\` |
+          | Implementar lógica de negocio | Solo crear \`tests/step_defs/\` |
+          | Implementar endpoints FastAPI | No tocar \`.feature\` aprobados |
+          | Crear step definitions pytest-bdd | No agregar dependencias |
+
+          > El PR de implementación será validado automáticamente por CI y el review loop."
+          else
+            gh issue comment "$IMPL_ISSUE" \
+              --repo "${{ github.repository }}" \
+              --body "✅ **Issue de implementación creado.**
+
+          No se pudo asignar Copilot automáticamente. Asígnalo manualmente:
+
+          1. Sidebar → **Assignees** → selecciona **Copilot**
+          2. Selecciona el agente: **agent-developer**
+
+          > Verifica que el secreto \`COPILOT_USER_ACCESS_TOKEN\` esté configurado (GitHub App user-to-server token refrescado por el workflow centralizado en .github-private)."
+          fi

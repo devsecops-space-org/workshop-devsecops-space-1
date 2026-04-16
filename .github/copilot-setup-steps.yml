@@ -1,0 +1,4 @@
+steps:
+  - name: "Setup Python environment"
+    run: |
+      pip install -r requirements.txt -r requirements-dev.txt

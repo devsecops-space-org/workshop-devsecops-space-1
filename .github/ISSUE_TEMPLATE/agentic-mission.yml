@@ -1,0 +1,115 @@
+name: "Misión Agéntica"
+description: "Issue estructurado para asignación a Copilot coding agent. El agente generará escenarios Gherkin BDD a partir de los campos de este Issue."
+title: "[AGENT] "
+labels: ["agentic-mission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Cómo llenar este Issue
+
+        Este Issue será leído por un agente de IA que generará escenarios Gherkin
+        a partir de lo que escribas aquí. Para obtener los mejores resultados:
+
+        - **Usa lenguaje de negocio**, no técnico. Describe qué debe hacer el sistema,
+          no cómo implementarlo.
+        - **Sé específico en el alcance.** Lo que no esté en "Alcance" no se implementará.
+          Lo que esté en "Fuera de Alcance" será ignorado explícitamente.
+        - **Las Reglas de Negocio son el insumo más importante.** Cada regla se convertirá
+          en al menos un escenario de prueba. Si una regla es ambigua, el escenario
+          también lo será.
+        - **Los Ejemplos del Dominio reducen la invención.** Incluye datos realistas
+          (válidos e inválidos) para que el agente no invente nombres ni valores.
+          Si una fecha exacta no importa, describe la intención (`fecha futura`,
+          `fecha pasada`) o usa una fecha lejana y estable.
+
+  - type: textarea
+    id: mission
+    attributes:
+      label: "Misión"
+      description: "Qué debe lograr esta tarea. Describe el objetivo en términos de negocio."
+      placeholder: |
+        Permitir a los empleados reservar salas de reunión disponibles,
+        respetando la capacidad de cada sala y evitando solapamientos de horarios.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: "Alcance (In Scope)"
+      description: "Qué está incluido en esta entrega. Usa bullets concretos."
+      placeholder: |
+        - Crear una reserva de sala con fecha, horario y número de asistentes.
+        - Listar todas las reservas existentes, con filtro opcional por sala.
+        - Consultar una reserva por su identificador.
+        - Cancelar una reserva futura.
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: "Fuera de Alcance"
+      description: "Qué NO debe hacer el agente. Lista explícitamente las exclusiones."
+      placeholder: |
+        - NO autenticación ni autorización.
+        - NO base de datos (almacenamiento en memoria).
+        - NO notificaciones por correo.
+        - NO edición parcial de una reserva existente.
+        - NO gestión del catálogo de salas (las salas son fijas).
+        - NO recurrencia de reservas.
+    validations:
+      required: true
+
+  - type: textarea
+    id: business_rules
+    attributes:
+      label: "Reglas de Negocio"
+      description: "Reglas verificables que rigen el comportamiento. Cada regla debe poder convertirse en al menos un escenario Gherkin."
+      placeholder: |
+        - Las salas existentes son: Sala A (capacidad 4), Sala B (capacidad 8), Sala C (capacidad 20).
+        - Una sala no puede tener dos reservas que se solapen en el mismo día.
+        - La hora de fin debe ser posterior a la hora de inicio.
+        - La duración mínima es 15 minutos y la máxima es 4 horas.
+        - Solo se permiten reservas en horario laboral (08:00 a 20:00).
+        - El número de asistentes no puede exceder la capacidad de la sala.
+        - El propósito es obligatorio y debe tener al menos 10 caracteres.
+        - Solo se pueden cancelar reservas futuras.
+    validations:
+      required: true
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: "Ejemplos del Dominio"
+      description: "Datos de muestra realistas que el agente puede usar como referencia para nombres, valores y casos típicos. Incluye ejemplos válidos e inválidos. Si una fecha exacta no importa, indica el tipo de fecha o usa una fecha lejana y estable."
+      placeholder: |
+        Reserva válida:
+          sala: B, fecha: 2099-06-01, hora_inicio: "10:00", hora_fin: "11:00",
+          solicitante: ana.lopez@empresa.com, asistentes: 5,
+          proposito: Revisión semanal del equipo de plataforma
+
+        Reserva inválida (excede capacidad):
+          sala: A, asistentes: 10 — La Sala A solo admite 4 personas.
+
+        Reserva inválida (solapamiento):
+          Si ya existe una reserva en Sala B el 2099-06-01 de 10:00 a 11:00,
+          no se puede crear otra en Sala B el 2099-06-01 de 10:30 a 11:30.
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: "Restricciones Técnicas"
+      description: "Stack, librerías permitidas, límites de arquitectura y reglas técnicas."
+      placeholder: |
+        - Python 3.11+
+        - FastAPI + Pydantic v2
+        - pytest-bdd
+        - Storage en memoria (dict)
+        - Sin dependencias nuevas
+        - Sin modificar workflows ni configuración
+    validations:
+      required: true

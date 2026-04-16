@@ -1,0 +1,51 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/python
+{
+  "name": "DevSecOps Agentic Demo",
+  // Python 3.11 on Debian 12 (bookworm)
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bookworm",
+
+  // Use 'forwardPorts' to make a list of ports inside the container available locally.
+  // Port 8000: uvicorn (FastAPI)
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": {
+      "label": "FastAPI",
+      "onAutoForward": "openBrowser",
+      "visibility": "public"
+    }
+  },
+
+  // Instalar dependencias y arrancar uvicorn.
+  // postCreateCommand corre en headless (CI) — postStartCommand NO.
+  // setsid crea nueva sesión para que uvicorn sobreviva al exit del shell.
+  "postCreateCommand": "pip3 install -r requirements.txt -r requirements-dev.txt && setsid bash -c 'nohup python -m uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload > /tmp/uvicorn.log 2>&1 & disown'",
+
+  // Configure tool-specific properties.
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.debugpy",
+        "charliermarsh.ruff",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff",
+          "editor.formatOnSave": true,
+          "editor.codeActionsOnSave": {
+            "source.fixAll": "explicit",
+            "source.organizeImports": "explicit"
+          }
+        },
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": ["tests"]
+      }
+    }
+  }
+
+  // Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+  // "remoteUser": "root"
+}

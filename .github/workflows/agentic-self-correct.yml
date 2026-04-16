@@ -1,0 +1,159 @@
+name: "Agentic - Self-Correction Loop"
+
+# Triggered when Copilot submits a review on an [IMPL] or [TEST] PR.
+#
+# Logic:
+#   1. Check if the review contains actual code ```suggestion blocks (not just comments).
+#   2. If suggestions exist and iterations < 3 → ask @copilot to implement them.
+#   3. If suggestions exist and iterations >= 3 → escalate with needs-human-review label.
+#   4. If no suggestions → no action (CI status determines merge readiness).
+#
+# Iteration tracking: counts comments containing "<!-- agentic-self-correct -->" on the PR.
+# Exit condition: Copilot review with zero suggestions + CI green = ready for human merge.
+#
+# Requires:
+#   - Secret COPILOT_USER_ACCESS_TOKEN (GitHub App user-to-server token) to post @copilot mentions — GITHUB_TOKEN cannot trigger bots.
+#   - Label "needs-human-review" in the repo (created automatically on first escalation).
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  self-correct:
+    name: "Evaluar Sugerencias de Copilot"
+    # Only act on [IMPL], [TEST] or [ATDD] PRs reviewed by Copilot.
+    if: >
+      (startsWith(github.event.pull_request.title, '[IMPL]') ||
+      startsWith(github.event.pull_request.title, '[TEST]') ||
+      startsWith(github.event.pull_request.title, '[ATDD]')) &&
+      contains(github.event.review.user.login, 'copilot')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Detectar sugerencias de código en la review
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_ID: ${{ github.event.review.id }}
+        run: |
+          # Inline review comments (the ones with ```suggestion) are in the pulls comments API.
+          # They differ from the PR conversation comments (issues API).
+          # --argjson parses REVIEW_ID as a JSON number for correct equality comparison.
+          SUGGESTION_MARKER='```suggestion'
+
+          HAS=$(gh api \
+            "/repos/${{ github.repository }}/pulls/${PR_NUMBER}/comments" \
+            --paginate \
+            | jq --slurp --argjson review_id "${REVIEW_ID}" \
+                 --arg marker "${SUGGESTION_MARKER}" \
+                 'add | [.[] | select(.pull_request_review_id == $review_id) | .body]
+                  | map(select(contains($marker)))
+                  | length > 0')
+
+          echo "has_suggestions=${HAS}" >> "$GITHUB_OUTPUT"
+
+          if [ "${HAS}" = "true" ]; then
+            echo "Sugerencias de código detectadas en review #${REVIEW_ID}."
+          else
+            echo "La review #${REVIEW_ID} no contiene sugerencias de código (solo comentarios narrativos)."
+          fi
+
+      - name: Contar iteraciones previas del loop
+        id: count
+        if: steps.detect.outputs.has_suggestions == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # PR conversation comments (issues API) contain our iteration markers.
+          # We count how many self-correction requests were already posted.
+          ITERATIONS=$(gh api \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            | jq --slurp 'add | [.[] | select(.body | contains("<!-- agentic-self-correct -->"))] | length')
+
+          echo "iterations=${ITERATIONS}" >> "$GITHUB_OUTPUT"
+          echo "Iteraciones previas: ${ITERATIONS}/3"
+
+          if [ "${ITERATIONS}" -lt 3 ]; then
+            NEXT=$((ITERATIONS + 1))
+            echo "can_iterate=true" >> "$GITHUB_OUTPUT"
+            echo "next_iteration=${NEXT}" >> "$GITHUB_OUTPUT"
+            echo "Ejecutando iteración ${NEXT}/3."
+          else
+            echo "can_iterate=false" >> "$GITHUB_OUTPUT"
+            echo "Límite de 3 iteraciones alcanzado."
+          fi
+
+      - name: Solicitar implementación de sugerencias a Copilot
+        if: >
+          steps.detect.outputs.has_suggestions == 'true' &&
+          steps.count.outputs.can_iterate == 'true'
+        env:
+          # Must use COPILOT_USER_ACCESS_TOKEN (GitHub App user token) — GITHUB_TOKEN (bot) cannot trigger @copilot.
+          GH_TOKEN: ${{ secrets.COPILOT_USER_ACCESS_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          NEXT: ${{ steps.count.outputs.next_iteration }}
+        run: |
+          BODY=$(cat <<'BODY_EOF'
+          <!-- agentic-self-correct -->
+          **Iteración de auto-corrección PLACEHOLDER_NEXT/3**
+
+          @copilot Tu review detectó sugerencias de código en este PR. Por favor implementa **todas** las sugerencias de tu última review en esta misma rama.
+
+          Una vez que hagas push, el CI validará los cambios automáticamente.
+
+          > Si el CI pasa y tu próxima review no contiene más sugerencias, el PR estará listo para merge humano.
+          BODY_EOF
+          )
+
+          BODY="${BODY//PLACEHOLDER_NEXT/${NEXT}}"
+
+          gh pr comment "${PR_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --body "${BODY}"
+
+      - name: Escalar — límite de iteraciones alcanzado
+        if: >
+          steps.detect.outputs.has_suggestions == 'true' &&
+          steps.count.outputs.can_iterate == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Ensure the label exists before trying to add it.
+          gh label create "needs-human-review" \
+            --color "e11d48" \
+            --description "El loop de auto-corrección no convergió. Requiere intervención humana." \
+            --repo "${{ github.repository }}" \
+            2>/dev/null || true
+
+          gh pr edit "${PR_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --add-label "needs-human-review"
+
+          BODY=$(cat <<'BODY_EOF'
+          ⚠️ **El loop de auto-corrección agotó 3 iteraciones sin converger.**
+
+          El agente no resolvió todas las sugerencias del reviewer en 3 intentos consecutivos.
+
+          **Acciones para el humano:**
+          - Revisar si las sugerencias del reviewer son contradictorias o ambiguas entre sí
+          - Verificar si el alcance del Issue original necesita ajuste
+          - Decidir manualmente qué sugerencias aplicar o descartar
+          - Una vez resuelto: retirar el label `needs-human-review` y hacer merge si CI está verde
+
+          > Label `needs-human-review` agregado para intervención humana.
+          BODY_EOF
+          )
+
+          gh pr comment "${PR_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --body "${BODY}"

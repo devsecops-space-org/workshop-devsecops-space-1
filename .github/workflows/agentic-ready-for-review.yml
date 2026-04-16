@@ -1,0 +1,139 @@
+name: "Agentic - Draft -> Ready for Review"
+
+# Marca automáticamente como "ready for review" cualquier PR draft abierto
+# o actualizado por Copilot.
+#
+# Objetivo:
+#   - Cuando Copilot abre un PR draft, pasarlo automáticamente a ready.
+#   - Cuando Copilot hace push adicional sobre un PR draft (synchronize),
+#     volver a evaluarlo y pasarlo a ready si sigue en draft.
+#   - Cuando Copilot renombra el PR desde un título temporal (por ejemplo,
+#     [WIP]) a [ATDD]/[IMPL]/[TEST], volver a evaluarlo.
+#
+# No depende de reviews, approvals ni suggestion blocks.
+# La señal correcta es que Copilot terminó una tanda de cambios sobre el PR.
+#
+# Seguridad:
+#   - Usa pull_request_target para disponer de secretos/permisos estables.
+#   - NO hace checkout ni ejecuta código del branch del PR.
+#   - Solo invoca APIs de GitHub (`gh pr view`, `gh pr ready`, `gh pr comment`).
+#
+# Requiere:
+#   - Secret COPILOT_USER_ACCESS_TOKEN (GitHub App user-to-server token) con permisos pull-requests write.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  mark-ready:
+    name: "Marcar PR como Ready for Review"
+    # Evaluado ANTES de provisionar runner → 0 minutos si es false.
+    # Filtra: solo PRs draft con título [ATDD], [IMPL] o [TEST].
+    if: >
+      github.event.pull_request.draft == true &&
+      (
+        startsWith(github.event.pull_request.title, '[ATDD]') ||
+        startsWith(github.event.pull_request.title, '[IMPL]') ||
+        startsWith(github.event.pull_request.title, '[TEST]')
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Evaluar si Copilot terminó una tanda de cambios
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_ACTOR: ${{ github.actor }}
+        run: |
+          SHOULD_READY="false"
+          REASON=""
+
+          is_copilot_actor() {
+            echo "$1" | grep -qi 'copilot'
+          }
+
+          has_supported_title() {
+            echo "$1" | grep -Eq '^\[(ATDD|IMPL|TEST)\]'
+          }
+
+          # PR draft recién abierto por Copilot.
+          if [ "$EVENT_ACTION" = "opened" ]; then
+            if is_copilot_actor "$PR_AUTHOR"; then
+              SHOULD_READY="true"
+              REASON="PR draft abierto por Copilot"
+            fi
+          fi
+
+          # Nueva tanda de cambios empujada por Copilot sobre la rama del PR.
+          if [ "$EVENT_ACTION" = "synchronize" ] || [ "$EVENT_ACTION" = "reopened" ]; then
+            if is_copilot_actor "$EVENT_ACTOR"; then
+              SHOULD_READY="true"
+              REASON="Copilot terminó una nueva tanda de cambios en el PR"
+            fi
+          fi
+
+          # Copilot renombró/editó el PR y ahora tiene un prefijo válido.
+          if [ "$EVENT_ACTION" = "edited" ]; then
+            if is_copilot_actor "$EVENT_ACTOR" && has_supported_title "$PR_TITLE"; then
+              SHOULD_READY="true"
+              REASON="Copilot actualizó el título del PR a un estado listo para revisión"
+            fi
+          fi
+
+          CURRENT_DRAFT=$(gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json isDraft \
+            --jq '.isDraft')
+
+          if [ "$CURRENT_DRAFT" != "true" ]; then
+            SHOULD_READY="false"
+            REASON="El PR ya no está en draft"
+          fi
+
+          echo "should_ready=${SHOULD_READY}" >> "$GITHUB_OUTPUT"
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+
+          if [ "$SHOULD_READY" = "true" ]; then
+            echo "PR #${PR_NUMBER} será marcado como ready for review: ${REASON}"
+          else
+            echo "PR #${PR_NUMBER} no cumple condiciones para ready for review."
+          fi
+
+      - name: Ejecutar gh pr ready
+        if: steps.check.outputs.should_ready == 'true'
+        env:
+          # COPILOT_USER_ACCESS_TOKEN (GitHub App user token) para garantizar permisos de escritura sobre draft status.
+          # GITHUB_TOKEN puede tener limitaciones con la mutación GraphQL
+          # markPullRequestReadyForReview en ciertos contextos.
+          GH_TOKEN: ${{ secrets.COPILOT_USER_ACCESS_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr ready "${PR_NUMBER}" \
+            --repo "${{ github.repository }}"
+
+          echo "PR #${PR_NUMBER} marcado como ready for review."
+
+      - name: Notificar en el PR
+        if: steps.check.outputs.should_ready == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REASON: ${{ steps.check.outputs.reason }}
+        run: |
+          gh pr comment "${PR_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --body "✅ **PR marcado automáticamente como Ready for Review.**
+
+          **Motivo:** ${REASON}
+
+          > Convertido de draft → ready for review porque Copilot terminó una tanda de cambios.
+          > Pendiente: revisión humana final y merge."

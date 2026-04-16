@@ -1,0 +1,161 @@
+name: "Functional Tests - Post Deploy"
+
+# Se invoca desde preview.yml (workflow_call) con la URL dinámica,
+# o manualmente via workflow_dispatch proporcionando la URL.
+
+on:
+  workflow_call:
+    inputs:
+      base_url:
+        description: "URL base de la API desplegada"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "URL base de la API (ej: https://...app.github.dev)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  functional-tests:
+    name: "Tests Funcionales contra API Real"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Obtener URL de la API desplegada
+        id: url
+        run: |
+          URL="${{ inputs.base_url }}"
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "URL de la API: ${URL}"
+
+      - name: Smoke test rápido (health check)
+        env:
+          API_URL: ${{ steps.url.outputs.url }}
+        run: |
+          echo "Verificando que la API está accesible..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${API_URL}/health" || echo "000")
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::API no responde en ${API_URL}/health (HTTP ${STATUS})."
+            echo "Los tests funcionales requieren una API accesible."
+            exit 1
+          fi
+          echo "API accesible (HTTP 200)."
+
+      - name: Verificar que existen tests funcionales
+        id: check
+        run: |
+          FUNC_COUNT=$(find tests/functional -name "test_*.py" 2>/dev/null | wc -l)
+          echo "functional_count=$FUNC_COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$FUNC_COUNT" -eq 0 ]; then
+            echo "::notice::No hay tests funcionales aún en tests/functional/."
+            echo "El agente agent-tester los generará cuando se aprueben escenarios."
+          else
+            echo "Encontrados $FUNC_COUNT archivos de test funcional."
+          fi
+
+      - name: Ejecutar tests funcionales
+        if: steps.check.outputs.functional_count != '0'
+        env:
+          API_URL: ${{ steps.url.outputs.url }}
+        run: |
+          pytest tests/functional/ \
+            -v \
+            --tb=short \
+            --base-url="${API_URL}" \
+            --junitxml=functional-results.xml \
+            || PYTEST_EXIT=$?
+
+          echo "pytest_exit=${PYTEST_EXIT:-0}" >> "$GITHUB_ENV"
+
+      - name: Publicar resultados en Step Summary
+        if: always() && steps.check.outputs.functional_count != '0'
+        env:
+          API_URL: ${{ steps.url.outputs.url }}
+        run: |
+          if [ -f functional-results.xml ]; then
+            TOTAL=$(python -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('functional-results.xml')
+          root = tree.getroot()
+          ts = root.find('testsuite') or root
+          tests = int(ts.get('tests', 0))
+          failures = int(ts.get('failures', 0))
+          errors = int(ts.get('errors', 0))
+          skipped = int(ts.get('skipped', 0))
+          passed = tests - failures - errors - skipped
+          print(f'{tests}|{passed}|{failures}|{errors}|{skipped}')
+          ")
+
+            IFS='|' read -r TESTS PASSED FAILURES ERRORS SKIPPED <<< "$TOTAL"
+
+            if [ "${pytest_exit:-0}" -eq 0 ]; then
+              BADGE="✅ Todos los tests pasaron"
+            else
+              BADGE="❌ Hay tests fallidos"
+            fi
+
+            cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## Tests Funcionales - Resultados
+
+          ${BADGE}
+
+          | Métrica | Valor |
+          |---|---|
+          | **Total** | ${TESTS} |
+          | **Passed** | ${PASSED} |
+          | **Failed** | ${FAILURES} |
+          | **Errors** | ${ERRORS} |
+          | **Skipped** | ${SKIPPED} |
+          | **API URL** | ${API_URL} |
+
+          > Tests ejecutados contra la API desplegada en Codespace efímero.
+          EOF
+          else
+            cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## Tests Funcionales
+
+          ⚠️ No se generó reporte de resultados.
+          Verificar logs del paso anterior.
+
+          | **API URL** | ${API_URL} |
+          EOF
+          fi
+
+      - name: Fallar si hay tests fallidos
+        if: steps.check.outputs.functional_count != '0' && env.pytest_exit != '0'
+        run: |
+          echo "::error::Hay tests funcionales fallidos (exit code: ${pytest_exit})."
+          exit "${pytest_exit}"
+
+      - name: Publicar aviso si no hay tests
+        if: steps.check.outputs.functional_count == '0'
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## Tests Funcionales
+
+          ℹ️ **No hay tests funcionales aún.**
+
+          Los tests se generarán automáticamente cuando:
+          1. Se apruebe un PR \`[ATDD]\` con escenarios Gherkin.
+          2. El agente \`agent-tester\` cree los step definitions en \`tests/functional/\`.
+
+          > Este workflow volverá a ejecutarse en el próximo deploy.
+          EOF

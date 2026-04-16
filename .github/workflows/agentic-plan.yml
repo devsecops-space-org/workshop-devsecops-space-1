@@ -1,0 +1,100 @@
+name: "Agentic - Planificación"
+
+# Gatilla cuando un Issue recibe el label agentic-mission.
+# Valida la estructura del Issue y asigna automáticamente a Copilot (agent-planner).
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  validate-and-assign:
+    name: "Validar Issue y Asignar Planificador"
+    if: github.event.label.name == 'agentic-mission'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validar estructura del Issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Obtener body del Issue via API (más seguro que expresiones de contexto)
+          ISSUE_BODY=$(gh api \
+            "/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}" \
+            --jq '.body')
+
+          MISSING=""
+          echo "$ISSUE_BODY" | grep -q "### Misión" || MISSING="${MISSING} Misión,"
+          echo "$ISSUE_BODY" | grep -q "### Alcance" || MISSING="${MISSING} Alcance,"
+          echo "$ISSUE_BODY" | grep -q "### Fuera de Alcance" || MISSING="${MISSING} Fuera de Alcance,"
+          echo "$ISSUE_BODY" | grep -Eq "### (Restricciones Técnicas|Restricciones)" || MISSING="${MISSING} Restricciones Técnicas,"
+
+          if [ -n "$MISSING" ]; then
+            gh issue comment "${{ github.event.issue.number }}" \
+              --repo "${{ github.repository }}" \
+              --body "**⚠️ Estructura incompleta.**
+
+          El Issue no contiene los campos requeridos:${MISSING}
+
+          Usa el template **Misión Agéntica** para crear el Issue con la estructura correcta."
+            echo "::error::Issue structure validation failed. Missing: $MISSING"
+            exit 1
+          fi
+
+      - name: Asignar Copilot (agent-planner)
+        id: assign
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_USER_ACCESS_TOKEN }}
+        run: |
+          # Asignar Copilot coding agent con custom agent profile
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/assignees" \
+            --input - <<< '{
+            "assignees": ["copilot-swe-agent[bot]"],
+            "agent_assignment": {
+              "target_repo": "${{ github.repository }}",
+              "base_branch": "main",
+              "custom_agent": "agent-planner"
+            }
+          }'
+
+          echo "Copilot asignado exitosamente."
+        continue-on-error: true
+
+      - name: Notificar estado
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASSIGN_OUTCOME: ${{ steps.assign.outcome }}
+        run: |
+          if [ "$ASSIGN_OUTCOME" = "success" ]; then
+            gh issue comment "${{ github.event.issue.number }}" \
+              --repo "${{ github.repository }}" \
+              --body "✅ **Agente de Planificación asignado automáticamente.**
+
+          Copilot está analizando el Issue y generará escenarios Gherkin BDD.
+
+          | Qué hará el agente | Restricción |
+          |---|---|
+          | Generar archivos \`.feature\` en \`tests/features/\` | Solo archivos .feature |
+          | Abrir un PR \`[ATDD]\` con los escenarios | No código Python |
+          | Cubrir: flujo principal, validación, caso límite, seguridad | No modificar código existente |
+
+          > Los escenarios requieren **aprobación humana** antes de avanzar a implementación."
+          else
+            gh issue comment "${{ github.event.issue.number }}" \
+              --repo "${{ github.repository }}" \
+              --body "✅ **Issue validado.**
+
+          No se pudo asignar Copilot automáticamente. Asígnalo manualmente:
+
+          1. Sidebar → **Assignees** → selecciona **Copilot**
+          2. Selecciona el agente: **agent-planner**
+
+          > Verifica que el secreto \`COPILOT_USER_ACCESS_TOKEN\` esté configurado (GitHub App user-to-server token refrescado por el workflow centralizado en .github-private)."
+          fi

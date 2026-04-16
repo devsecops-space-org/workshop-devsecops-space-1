@@ -1,0 +1,173 @@
+name: "Agentic - Testing Funcional"
+
+# Gatilla cuando un PR de escenarios ([ATDD]) es mergeado a main.
+# Crea un Issue de testing funcional y asigna automáticamente a Copilot (agent-tester).
+# Corre EN PARALELO con agentic-develop.yml — ambos se disparan al mergear [ATDD].
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  issues: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  trigger-tester:
+    name: "Crear Issue de Testing Funcional"
+    if: >
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.title, '[ATDD]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extraer referencia del Issue original
+        id: extract
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          ORIG_ISSUE=$(echo "$PR_BODY" | grep -oP '(Refs|Closes|Fixes) #\K\d+' | head -1)
+          if [ -z "$ORIG_ISSUE" ]; then
+            ORIG_ISSUE="N/A"
+          fi
+          echo "original_issue=$ORIG_ISSUE" >> "$GITHUB_OUTPUT"
+
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          CLEAN_TITLE=$(echo "$PR_TITLE" | sed 's/\[ATDD\] Escenarios para: //')
+          echo "clean_title=$CLEAN_TITLE" >> "$GITHUB_OUTPUT"
+
+      - name: Listar features aprobados
+        id: features
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FEATURE_FILES=$(gh pr diff "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --name-only | grep '\.feature$' || echo "No se encontraron .feature")
+
+          FEATURE_LIST=""
+          while IFS= read -r file; do
+            FEATURE_LIST="${FEATURE_LIST}- \`${file}\`
+          "
+          done <<< "$FEATURE_FILES"
+
+          echo "feature_list<<FEATURES_EOF" >> "$GITHUB_OUTPUT"
+          echo "$FEATURE_LIST" >> "$GITHUB_OUTPUT"
+          echo "FEATURES_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Crear Issue de testing funcional y asignar Copilot
+        id: create_issue
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_USER_ACCESS_TOKEN }}
+          ORIG_ISSUE: ${{ steps.extract.outputs.original_issue }}
+          CLEAN_TITLE: ${{ steps.extract.outputs.clean_title }}
+          FEATURE_LIST: ${{ steps.features.outputs.feature_list }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$ORIG_ISSUE" != "N/A" ]; then
+            ISSUE_REF="Refs #${ORIG_ISSUE}"
+          else
+            ISSUE_REF="Sin referencia directa — revisar PR #${PR_NUMBER}."
+          fi
+
+          BODY=$(cat <<'BODY_HEREDOC'
+          ## Tests Funcionales Requeridos
+
+          Los escenarios BDD fueron aprobados y mergeados en PR #PLACEHOLDER_PR.
+          Genera step definitions funcionales que validen la API desplegada.
+
+          ### Issue Original
+          PLACEHOLDER_ISSUE_REF
+
+          ### Escenarios Aprobados
+          PLACEHOLDER_FEATURES
+
+          ### Instrucciones
+
+          1. Lee TODOS los archivos `.feature` en `tests/features/`.
+          2. Consulta `src/main.py` para conocer las rutas de los endpoints.
+          3. Genera step definitions funcionales en `tests/functional/test_<dominio>_functional.py`.
+          4. Usa la fixture `api_client` (httpx) de `tests/functional/conftest.py`.
+          5. Usa la fixture `context` (dict) para compartir estado entre steps.
+          6. Verifica que `ruff check` y `ruff format --check` pasen.
+          7. Abre un PR con título `[TEST] Tests funcionales: PLACEHOLDER_TITLE`.
+
+          ### Restricciones
+          - NO modifiques los archivos `.feature` aprobados.
+          - NO modifiques `tests/step_defs/` ni `tests/conftest.py`.
+          - NO modifiques `src/`, workflows ni configuración.
+          - NO agregues dependencias (httpx ya existe en requirements-dev.txt).
+          - Crea SOLO archivos en `tests/functional/`.
+          BODY_HEREDOC
+          )
+
+          BODY="${BODY//PLACEHOLDER_PR/$PR_NUMBER}"
+          BODY="${BODY//PLACEHOLDER_ISSUE_REF/$ISSUE_REF}"
+          BODY="${BODY//PLACEHOLDER_FEATURES/$FEATURE_LIST}"
+          BODY="${BODY//PLACEHOLDER_TITLE/$CLEAN_TITLE}"
+
+          RESPONSE=$(jq -n \
+            --arg title "[TEST] Tests funcionales: $CLEAN_TITLE" \
+            --arg body "$BODY" \
+            --arg repo "${{ github.repository }}" \
+            '{
+              title: $title,
+              body: $body,
+              labels: ["agentic-testing"],
+              assignees: ["copilot-swe-agent[bot]"],
+              agent_assignment: {
+                target_repo: $repo,
+                base_branch: "main",
+                custom_agent: "agent-tester"
+              }
+            }' | gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${{ github.repository }}/issues" \
+              --input -)
+
+          TEST_ISSUE=$(echo "$RESPONSE" | jq -r '.number')
+          echo "test_issue=$TEST_ISSUE" >> "$GITHUB_OUTPUT"
+          echo "Issue #${TEST_ISSUE} creado con Copilot (agent-tester) asignado."
+        continue-on-error: true
+
+      - name: Notificar estado
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CREATE_OUTCOME: ${{ steps.create_issue.outcome }}
+          TEST_ISSUE: ${{ steps.create_issue.outputs.test_issue }}
+        run: |
+          if [ -z "$TEST_ISSUE" ] || [ "$TEST_ISSUE" = "null" ]; then
+            echo "::error::No se pudo crear el Issue de testing funcional."
+            echo "Verifica que COPILOT_USER_ACCESS_TOKEN y el label 'agentic-testing' existan."
+            exit 1
+          fi
+
+          if [ "$CREATE_OUTCOME" = "success" ]; then
+            gh issue comment "$TEST_ISSUE" \
+              --repo "${{ github.repository }}" \
+              --body "✅ **Agente de Testing Funcional asignado automáticamente.**
+
+          Copilot está generando step definitions funcionales (httpx) para los escenarios aprobados.
+
+          | Qué hará el agente | Restricción |
+          |---|---|
+          | Leer escenarios \`.feature\` aprobados | No tocar \`.feature\` |
+          | Generar steps funcionales en \`tests/functional/\` | No tocar \`tests/step_defs/\` |
+          | Usar \`api_client\` (httpx) como cliente HTTP | No tocar \`src/\` |
+          | Abrir PR \`[TEST]\` con los tests | No agregar dependencias |
+
+          > Los tests se ejecutarán automáticamente cuando la API sea desplegada en un Codespace efímero."
+          else
+            gh issue comment "$TEST_ISSUE" \
+              --repo "${{ github.repository }}" \
+              --body "✅ **Issue de testing funcional creado.**
+
+          No se pudo asignar Copilot automáticamente. Asígnalo manualmente:
+
+          1. Sidebar → **Assignees** → selecciona **Copilot**
+          2. Selecciona el agente: **agent-tester**"
+          fi
