@@ -20,7 +20,7 @@ class ConflictoReserva(ValueError):
 class _ReservaDato(TypedDict):
     id: str
     sala: str
-    fecha: str
+    fecha: date
     hora_inicio: str
     hora_fin: str
     asistentes: int
@@ -111,8 +111,7 @@ def cancelar_reserva(reserva_id: str) -> None:
     if reserva_id not in _storage:
         raise KeyError(f"Reserva con id '{reserva_id}' no encontrada")
     reserva = _storage[reserva_id]
-    fecha_reserva = date.fromisoformat(reserva["fecha"])
-    if fecha_reserva < date.today():
+    if reserva["fecha"] < date.today():
         raise ValueError("No se puede cancelar una reserva que ya ocurrió")
     del _storage[reserva_id]
 
