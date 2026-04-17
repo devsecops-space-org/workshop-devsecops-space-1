@@ -58,7 +58,7 @@ def horario_laboral(hora_inicio: str, hora_fin: str, api_client: httpx.Client) -
 def no_existen_reservas(api_client: httpx.Client) -> None:
     reset_resp = api_client.post("/api/v1/_reset")
     assert reset_resp.status_code in (200, 204), (
-        f"Error al resetear estado: {reset_resp.status_code}"
+        f"Error al resetear estado: {reset_resp.status_code} - {reset_resp.text}"
     )
     response = api_client.get("/api/v1/reservas")
     assert response.status_code == 200
@@ -87,7 +87,8 @@ def existe_reserva(
     existentes = [
         r
         for r in listado.json()
-        if r["fecha"] == fecha
+        if r["sala"] == sala
+        and r["fecha"] == fecha
         and r["hora_inicio"] == hora_inicio
         and r["hora_fin"] == hora_fin
         and r["asistentes"] == asistentes
