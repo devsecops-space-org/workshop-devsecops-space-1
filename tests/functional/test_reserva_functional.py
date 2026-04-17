@@ -1,9 +1,35 @@
 """Tests funcionales: Gestión de reservas de salas de reunión."""
 
+from collections.abc import Generator
+
 import httpx
+import pytest
 from pytest_bdd import given, parsers, scenarios, then, when
 
 scenarios("../features/reserva.feature")
+
+
+# ─────────────────────────────────────────────
+# Aislamiento de estado por escenario
+# ─────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _reset_estado(api_client: httpx.Client) -> Generator[None, None, None]:
+    """Limpia el estado antes y después de cada escenario."""
+    _limpiar(api_client)
+    yield
+    _limpiar(api_client)
+
+
+def _limpiar(api_client: httpx.Client) -> None:
+    reset_resp = api_client.post("/api/v1/_reset")
+    assert reset_resp.status_code in (200, 204), (
+        f"Error al resetear estado: {reset_resp.status_code} - {reset_resp.text}"
+    )
+    response = api_client.get("/api/v1/reservas")
+    assert response.status_code == 200
+    assert response.json() == [], f"_reset no limpió el estado: {response.json()}"
 
 
 # ─────────────────────────────────────────────
@@ -56,13 +82,9 @@ def horario_laboral(hora_inicio: str, hora_fin: str, api_client: httpx.Client) -
 
 @given("que no existen reservas en el sistema")
 def no_existen_reservas(api_client: httpx.Client) -> None:
-    reset_resp = api_client.post("/api/v1/_reset")
-    assert reset_resp.status_code in (200, 204), (
-        f"Error al resetear estado: {reset_resp.status_code} - {reset_resp.text}"
-    )
     response = api_client.get("/api/v1/reservas")
     assert response.status_code == 200
-    assert response.json() == [], f"_reset no limpió el estado: {response.json()}"
+    assert response.json() == [], f"Estado no limpio al inicio del escenario: {response.json()}"
 
 
 @given(
